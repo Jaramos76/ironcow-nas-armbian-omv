@@ -1,5 +1,9 @@
 # Iron Cow RK3568 NAS → Armbian + OpenMediaVault
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+![OpenMediaVault login screen](images/omv-login.jpg)
+
 Guía paso a paso, completa y probada de punta a punta, para reemplazar el firmware
 de fábrica (con backdoor de "phone home") de un NAS "Iron Cow" basado en RK3568 por
 Armbian + OpenMediaVault, usando una Raspberry Pi como consola de debug y puente de
