@@ -4,64 +4,67 @@
 
 ![OpenMediaVault login screen](images/omv-login.jpg)
 
-Guía paso a paso, completa y probada de punta a punta, para reemplazar el firmware
-de fábrica (con backdoor de "phone home") de un NAS "Iron Cow" basado en RK3568 por
-Armbian + OpenMediaVault, usando una Raspberry Pi como consola de debug y puente de
-transferencia. Incluye todos los problemas reales encontrados en el camino y cómo
-se resolvieron, no solo los comandos que funcionaron al final.
+A complete, end-to-end tested, step-by-step guide to replacing the factory
+firmware (which phones home) on an "Iron Cow" RK3568-based NAS with Armbian +
+OpenMediaVault, using a Raspberry Pi as a debug console and transfer bridge.
+This includes every real problem hit along the way and how it was solved, not
+just the commands that worked in the end.
 
-Este proceso se hizo íntegramente por consola serial UART, sin necesidad de abrir
-la carcasa más allá de acceder al header de debug, y sin arriesgar el eMMC hasta
-validar todo primero por USB.
+The whole process was done entirely over a UART serial console, without
+needing to open the case beyond reaching the internal debug header, and
+without risking the eMMC until everything was validated over USB first.
 
-> **Nota:** todos los valores como IPs, UUIDs, nombres de usuario y
-> contraseñas en esta guía son placeholders genéricos (`<ip-del-nas>`,
-> `<uuid>`, `/dev/sdX`, etc.). Reemplazalos siempre por los datos reales de
-> tu propio equipo — nunca copies un valor de esta guía como si fuera literal.
+> **Note:** every value like IPs, UUIDs, usernames, and passwords in this
+> guide is a generic placeholder (`<nas-ip>`, `<uuid>`, `/dev/sdX`, etc.).
+> Always replace them with your own hardware's real values — never copy a
+> value from this guide as if it were literal.
 
-## Por qué
+## Why
 
-El firmware de fábrica de este NAS:
-- Llama a `portal.iron-cow-ainas.com` (y variantes) en cada boot, incluso sin
-  configuración de usuario — telemetría/phone-home no solicitado.
-- Corre un túnel VPN de acceso remoto (`tunsvr`) habilitado por defecto.
-- Tiene un daemon de monitoreo (`nasMonitor.py`) adicional.
-- Su eMMC además mostraba errores de I/O reales en el arranque (hardware
-  defectuoso, no filesystem corrupto — confirmado con `e2fsck`).
+This NAS's factory firmware:
+- Calls `portal.iron-cow-ainas.com` (and variants) on every boot, even with no
+  user configuration — unsolicited telemetry/phone-home.
+- Runs a remote-access VPN tunnel (`tunsvr`) enabled by default.
+- Has an additional monitoring daemon (`nasMonitor.py`).
+- Its eMMC also showed real I/O errors at boot (flaky hardware, not a
+  corrupted filesystem — confirmed with `e2fsck`).
 
-## Crédito
+## Credit
 
-El device tree parcheado para este NAS (`rk3568-nas.dtb`) viene del repositorio
-público de **gloriouspidgeon855**: https://github.com/gloriouspidgeon855/IroncowNASArmbian
-Esta guía documenta el proceso completo alrededor de ese device tree: cómo llegar
-a él, cómo probarlo de forma segura, y cómo dejarlo arrancando automáticamente
-desde el eMMC interno con OpenMediaVault instalado y funcionando.
+The patched device tree for this NAS (`rk3568-nas.dtb`) comes from
+**gloriouspidgeon855**'s public repository:
+https://github.com/gloriouspidgeon855/IroncowNASArmbian
+This guide documents the full process around that device tree: how to get to
+it, how to test it safely, and how to get it booting automatically from
+internal eMMC with OpenMediaVault installed and running.
 
-## Qué necesitás
+## What you need
 
-- El NAS Iron Cow (RK3568), con acceso físico al header de debug UART interno.
-- Una Raspberry Pi (se usó una Pi 5) para hacer de consola serial y puente de red.
-- 3 cables jumper hembra-hembra.
-- Una microSD o pendrive USB de al menos 8GB para las pruebas (no se toca el eMMC
-  hasta el final).
-- Un cable Ethernet directo (o adaptador USB-Ethernet) entre la Pi y el NAS para
-  transferir archivos grandes sin depender de red compartida.
+- The Iron Cow NAS (RK3568), with physical access to its internal UART debug
+  header.
+- A Raspberry Pi (a Pi 5 was used) to act as the serial console and network
+  bridge.
+- 3 female-to-female jumper wires.
+- A microSD or USB flash drive of at least 8GB for testing (the eMMC isn't
+  touched until the very end).
+- A direct Ethernet cable (or USB-Ethernet adapter) between the Pi and the NAS
+  to transfer large files without depending on shared network infrastructure.
 
 ---
 
-## Parte 1 — Consola serial UART
+## Part 1 — UART serial console
 
-**Cableado (con el NAS apagado):**
+**Wiring (with the NAS powered off):**
 
-| Pi (GPIO header) | NAS (header de debug) |
+| Pi (GPIO header) | NAS (debug header) |
 |---|---|
 | Pin 8 (GPIO14 / TXD) | RX |
 | Pin 10 (GPIO15 / RXD) | TX |
 | Pin 6 (GND) | GND |
 
-**No conectar el pin de 3.3V.**
+**Do not connect the 3.3V pin.**
 
-**En la Pi:**
+**On the Pi:**
 
 ```bash
 sudo raspi-config
@@ -71,359 +74,362 @@ sudo raspi-config
 # Reboot
 ```
 
-Confirmá que aparece `/dev/serial0` (o `/dev/ttyAMA0`) después del reboot.
+Confirm `/dev/serial0` (or `/dev/ttyAMA0`) exists after the reboot.
 
 ```bash
 sudo apt install screen
 sudo screen /dev/serial0 1500000
 ```
 
-Prendé el NAS y deberías ver el log de arranque del boot ROM / U-Boot / Debian.
-Texto ilegible = cableado invertido o baudrate incorrecto. Sin nada = revisar
-cableado/alimentación.
+Power on the NAS and you should see boot ROM / U-Boot / Debian boot log
+output. Garbled text = wiring reversed or wrong baudrate. Nothing at all =
+check wiring/power.
 
 ---
 
-## Parte 2 — Entrar a U-Boot sin botón de recovery físico
+## Part 2 — Breaking into U-Boot with no physical recovery button
 
-El botón de recovery físico (pinhole trasero) **no funcionó** en ningún intento
-en este NAS — no lo asumas como primera opción.
+The physical recovery button (rear pinhole) **did not work** on any attempt on
+this NAS — don't assume it as your first option.
 
-El U-Boot de este NAS (Rockchip vendor U-Boot 2017.09) tiene `bootdelay=0`
-(sin ventana de reacción humana), pero como respeta `CONFIG_ZERO_BOOTDELAY_CHECK`,
-un byte Ctrl+C que ya esté esperando en el buffer RX del UART en el instante exacto
-del boot sí lo detiene.
+This NAS's U-Boot (Rockchip vendor U-Boot 2017.09) has `bootdelay=0` (no
+human-reaction-time window), but because it honors
+`CONFIG_ZERO_BOOTDELAY_CHECK`, a Ctrl+C byte already sitting in the UART RX
+buffer at the exact instant of boot still stops it.
 
-**Técnica:** un script Python (pyserial) que manda `\x03` (Ctrl+C) en loop cerrado
-durante ~45s mientras el NAS se enciende (o reinicia) *durante* esa ventana.
+**Technique:** a Python script (pyserial) that floods `\x03` (Ctrl+C) in a
+tight loop for ~45s while the NAS is powered on (or rebooted) *during* that
+window.
 
-Ver [`scripts/uboot_break.py`](scripts/uboot_break.py). Uso:
+See [`scripts/uboot_break.py`](scripts/uboot_break.py). Usage:
 
 ```bash
 python3 scripts/uboot_break.py
-# el script avisa cuando empezar — ahí es cuando hay que enchufar el power del NAS
+# the script tells you when to start — that's when you power on the NAS
 ```
 
-Vas a ver `=> <INTERRUPT>` repetido en la salida cuando lo logra — eso es el
-prompt de U-Boot (`=>`).
+You'll see `=> <INTERRUPT>` repeated in the output when it works — that's the
+U-Boot prompt (`=>`).
 
-Si el NAS ya está encendido y corriendo Linux (no apagado), usá en cambio
-[`scripts/reboot_and_break.py`](scripts/reboot_and_break.py), que dispara el
-reboot vía `sysrq` **antes** de empezar el flood — importante: arrancar el flood
-*antes* de mandar el trigger de reboot, no después, porque el apagado de systemd
-puede tardar varios segundos impredecibles y comerse toda la ventana si el flood
-arranca tarde.
+If the NAS is already powered on and running Linux (not off), use
+[`scripts/reboot_and_break.py`](scripts/reboot_and_break.py) instead, which
+triggers the reboot via `sysrq` **before** starting the flood — important:
+start the flood *before* sending the reboot trigger, not after, since
+systemd's shutdown sequence can take several unpredictable seconds and eat the
+whole window if the flood starts late.
 
 ---
 
-## Parte 3 — Acceso root persistente, sin saber la password
+## Part 3 — Persistent root access, without knowing the password
 
-Desde el prompt `=>` de U-Boot:
+From the U-Boot `=>` prompt:
 
 ```
 setenv bootargs "${bootargs} init=/bin/sh"
 boot
 ```
 
-Esto bootea directo a una shell root (`/bin/sh` como PID 1), bypaseando el login
-por completo. Es un cambio de un solo boot (no se hizo `saveenv`), así que no
-toca nada persistente del eMMC.
+This boots straight into a root shell (`/bin/sh` as PID 1), bypassing login
+entirely. It's a one-boot-only change (no `saveenv` was used), so it doesn't
+touch anything persistent on the eMMC.
 
-El entorno es mínimo — no hay `/proc`, `/sys`, ni `/etc/mtab` montados:
+The environment is minimal — no `/proc`, `/sys`, or `/etc/mtab` mounted:
 
 ```sh
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 ```
 
-Confirmá que el root (`/`, típicamente `mmcblk0p6` en este modelo) está montado
-`rw` (lo estaba en este caso pese al parámetro `ro` del kernel cmdline, que este
-U-Boot ignora). Después:
+Confirm that root (`/`, typically `mmcblk0p6` on this model) is mounted `rw`
+(it was in this case despite the kernel cmdline's `ro` parameter, which this
+U-Boot ignores). Then:
 
 ```sh
-passwd          # setear password de root
+passwd          # set a root password
 sync
 reboot -f
 ```
 
-Desde ese momento, login normal como `root` con la password que pusiste, sin
-volver a necesitar la danza de U-Boot para acceso básico.
+From then on, log in normally as `root` with the password you set, no more
+need for the U-Boot dance for basic access.
 
 ---
 
-## Parte 4 — Salud del eMMC
+## Part 4 — eMMC health check
 
-El firmware de fábrica mostraba errores reales de I/O en boot
+The factory firmware showed real I/O errors at boot
 (`blk_update_request: I/O error`, `mmc0: Timeout waiting for hardware interrupt`,
-`cache flush error -110`). Antes de asumir que el filesystem estaba corrupto:
+`cache flush error -110`). Before assuming the filesystem was corrupted:
 
 ```sh
-e2fsck -n /dev/mmcblk0p6     # -n: solo reporta, no modifica nada
+e2fsck -n /dev/mmcblk0p6     # -n: report only, don't modify anything
 ```
 
-En este caso: 0 errores estructurales en las 5 pasadas. Los errores de boot eran
-**flakiness del controlador eMMC a nivel hardware**, no corrupción de filesystem
-— no arreglable con fsck, pero suficientemente estable para arrancar el SO
-mientras los datos reales del NAS vivan en discos SATA, no en el eMMC.
+In this case: 0 structural errors across all 5 passes. The boot-time errors
+were **eMMC controller-level hardware flakiness**, not filesystem corruption
+— not fixable via fsck, but stable enough to boot the OS as long as the NAS's
+actual data lives on SATA drives, not the eMMC.
 
 ---
 
-## Parte 5 — Desactivar el phone-home / backdoor de fábrica
+## Part 5 — Disabling the factory phone-home / backdoor
 
-En `/etc/rc.local` del firmware de fábrica había tres procesos de
-telemetría/acceso remoto lanzados en cada boot:
+The factory firmware's `/etc/rc.local` launched three
+telemetry/remote-access processes on every boot:
 
-- `check_rtcp.sh` → llama cada 5min a `check_rtcp.lua`, que hace `curl` a una URL
-  de "portal" (históricamente `portal.iron-cow-ainas.com`, con un valor viejo
-  comentado `portal.wocyber.com` como posible vendor relacionado).
-- `tunsvr /etc/server.ini` → el túnel VPN de acceso remoto.
-- `nasMonitor.py` → telemetría/monitoreo.
+- `check_rtcp.sh` → calls `check_rtcp.lua` every 5min, which `curl`s a
+  "portal" URL (historically `portal.iron-cow-ainas.com`, with an old
+  commented-out value `portal.wocyber.com` as a possibly related vendor).
+- `tunsvr /etc/server.ini` → the remote-access VPN tunnel.
+- `nasMonitor.py` → telemetry/monitoring.
 
-Se desactivaron comentando sus líneas de lanzamiento en `/etc/rc.local` (efecto
-tras reboot). Los logs de nginx (`/usr/local/openresty/nginx/logs/error.log`)
-mostraban que esta unidad específica **había estado pareada con la nube antes**
-(flujo de login QR contra `us-portal.iron-cow-ainas.com`) — el estado de ese
-pareo puede seguir vivo del lado del servidor del fabricante aunque localmente
-ya no llame a nada.
+These were disabled by commenting out their launch lines in `/etc/rc.local`
+(takes effect after a reboot). The nginx logs
+(`/usr/local/openresty/nginx/logs/error.log`) showed that this specific unit
+**had been cloud-paired before** (QR-code login flow against
+`us-portal.iron-cow-ainas.com`) — that pairing state may still be live
+server-side on the manufacturer's end even though it no longer calls out
+locally.
 
-**Ojo con esto también (no tocado, pero a tener en cuenta):** `rc.local` hace
-`rm -rf /disk0/* /disk1/* /disk2/*` en cada boot. Inofensivo con discos SATA
-vacíos/desconectados, pero destructivo si alguna vez bootea el firmware de
-fábrica con discos reales montados ahí sin querer.
+**Also worth knowing (not touched, but be aware):** `rc.local` runs
+`rm -rf /disk0/* /disk1/* /disk2/*` on every boot. Harmless with empty/
+disconnected SATA drives, but destructive if you ever boot the factory
+firmware with real drives mounted there unintentionally.
 
-Esta parte es relevante solo si vas a seguir usando el firmware de fábrica un
-tiempo antes de reemplazarlo. Si vas directo a Armbian, podés saltarla.
+This part only matters if you're going to keep using the factory firmware for
+a while before replacing it. If you're going straight to Armbian, you can
+skip it.
 
 ---
 
-## Parte 6 — Conseguir el device tree de Armbian
+## Part 6 — Getting the Armbian device tree
 
-En vez de reversear el device tree desde cero, usá el ya construido y probado
-por la comunidad: https://github.com/gloriouspidgeon855/IroncowNASArmbian
+Instead of reverse-engineering the device tree from scratch, use the one
+already built and tested by the community:
+https://github.com/gloriouspidgeon855/IroncowNASArmbian
 
-Archivos clave de ese repo:
-- `rk3568-nas.dtb` / `.dts` — compilado contra kernel 6.12, derivado del `.dtb`
-  de fábrica comparado con el `.dts` mainline del QNAP TS433 (hardware similar).
-- `armbianEnv.txt` / `extlinux.conf` — configs de boot. **El `UUID=` de ambos hay
-  que editarlo para que coincida con el UUID real de la partición root de la
-  imagen que termines usando** — sin esto el board no bootea (cae a emergency
-  shell). El README de ese repo lo aclara también.
-- `armbianOnAUSBStick.md` — documenta probar por USB antes de tocar el eMMC, y
-  confirma la misma técnica de Ctrl+C-flood usada acá.
-- Nota sobre el puerto USB del NAS: arranca en modo *device* (cliente) por
-  defecto y hay que pasarlo a modo *host* para que reconozca un pendrive:
+Key files from that repo:
+- `rk3568-nas.dtb` / `.dts` — compiled against kernel 6.12, derived from the
+  stock `.dtb` compared against the mainline QNAP TS433 `.dts` (similar
+  hardware).
+- `armbianEnv.txt` / `extlinux.conf` — boot configs. **Both need their
+  `UUID=` value edited to match the actual root partition UUID of whatever
+  image you end up using** — without this, the board won't boot (drops to an
+  emergency shell). That repo's own README stresses this too.
+- `armbianOnAUSBStick.md` — documents testing over USB before touching the
+  eMMC, and confirms the same Ctrl+C-flood technique used here.
+- Note on the NAS's USB port: it defaults to *device* mode (client) and needs
+  to be flipped to *host* mode for a USB stick to be recognized:
   ```sh
   echo host > /sys/kernel/debug/usb/fcc00000.dwc3/mode
   ```
-  (path alternativo visto en `rc.local` del firmware de fábrica:
-  `/sys/devices/platform/fe8a0000.usb2-phy/otg_mode` — puede depender de la
-  revisión de placa, probar ambos si uno no existe).
-- `unspyware.sh` de ese repo **no usar tal cual**: pese al nombre, *habilita*
-  `tunsvr`/`check_rtcp.lua` en vez de desactivarlos — es lo opuesto de la Parte 5.
+  (alternate path seen in the factory firmware's `rc.local`:
+  `/sys/devices/platform/fe8a0000.usb2-phy/otg_mode` — may be board-revision
+  dependent, try both if one doesn't exist).
+- That repo's `unspyware.sh` — **don't use it as-is**: despite the name, it
+  *enables* `tunsvr`/`check_rtcp.lua` instead of disabling them — the opposite
+  of Part 5.
 
-Descargá también una imagen Armbian actual para el board más parecido
-disponible (se usó **Odroid M1S**, que también es RK3568) desde
-armbian.com — Debian 13 (trixie) mínima.
+Also download a current Armbian image for the closest available board (an
+**Odroid M1S**, also RK3568, was used) from armbian.com — Debian 13 (trixie)
+minimal.
 
 ---
 
-## Parte 7 — Probar primero por USB, nunca directo al eMMC
+## Part 7 — Test over USB first, never straight to eMMC
 
-**No toques el eMMC sin haber arrancado Armbian con éxito desde un pendrive o
-microSD USB primero.**
+**Don't touch the eMMC without having successfully booted Armbian from a USB
+flash drive or microSD first.**
 
-1. Escribí la imagen de Armbian descargada a un pendrive/microSD vía USB:
+1. Write the downloaded Armbian image to a USB flash drive/microSD:
    ```sh
    xzcat armbian_....img.xz | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
    ```
-2. **Verificá checksums del archivo recién escrito contra el original,
-   siempre.** En este proceso, un `dd`/pipe que "termina sin error" **no** es
-   garantía de integridad — se encontró corrupción silenciosa real en una
-   escritura así (ver Parte 9, mismo patrón repetido dos veces en esta guía).
-   Montá la partición del pendrive y comparná `md5sum` archivo por archivo
-   contra el original (podés loop-mount el `.img` decomprimido con
-   `udisksctl loop-setup -f archivo.img`, sin sudo).
-3. Copiá `rk3568-nas.dtb`, `armbianEnv.txt` (con el UUID corregido a la
-   partición real del pendrive) y `extlinux/extlinux.conf` (mismo UUID, y
-   `FDT /rk3568-nas.dtb` apuntando al dtb) al `/boot` del pendrive.
-4. Conectá el pendrive al puerto USB del NAS (recordá pasarlo a modo host,
-   Parte 6).
-5. Entrá a U-Boot (Parte 2) y probá el boot manual:
+2. **Always verify checksums of the freshly written file against the
+   original.** In this process, a `dd`/pipe that "finishes without error" is
+   **not** proof of integrity — real silent corruption was found from a write
+   like this (see Part 9, the same pattern repeats twice in this guide). Mount
+   the USB drive's partition and compare `md5sum` file by file against the
+   original (you can loop-mount the decompressed `.img` with
+   `udisksctl loop-setup -f file.img`, no sudo needed).
+3. Copy `rk3568-nas.dtb`, `armbianEnv.txt` (with the UUID corrected to the USB
+   drive's real partition) and `extlinux/extlinux.conf` (same UUID, and
+   `FDT /rk3568-nas.dtb` pointing at the dtb) to the USB drive's `/boot`.
+4. Connect the USB drive to the NAS's USB port (remember to flip it to host
+   mode, Part 6).
+5. Enter U-Boot (Part 2) and try the manual boot:
    ```
    run distro_bootcmd
    ```
-   Si `distro_bootcmd` no encuentra el kernel automáticamente (nombres de
-   archivo distintos entre versiones de Armbian — a veces es `vmlinuz` plano, a
-   veces un symlink a `vmlinuz-<version>`), cargalo manual:
+   If `distro_bootcmd` doesn't find the kernel automatically (filenames differ
+   between Armbian versions — sometimes a bare `vmlinuz`, sometimes a symlink
+   to `vmlinuz-<version>`), load it manually:
    ```
-   load usb 0:1 <addr> /boot/<archivo-real>
+   load usb 0:1 <addr> /boot/<actual-filename>
    ...
    booti <kernel_addr> <initrd_addr> <fdt_addr>
    ```
 
-### Bug real encontrado acá (y cómo diagnosticarlo)
+### A real bug found here (and how to diagnose it)
 
-Si `load`/`ext4load` reporta el tamaño de bytes correcto pero el kernel/initrd
-no arrancan (o el contenido cargado en RAM es garbage), **no asumas que es un
-bug del driver ext4 de este U-Boot** — antes de nada, verificá con
-`md.b <addr> 40` que los primeros bytes cargados tengan el magic header
-correcto (`d0 0d fe ed` para un `.dtb`, cabecera ELF/ARM64 para el kernel). En
-este proceso, la causa real terminó siendo que el archivo en el disco de origen
-ya estaba corrupto por una escritura previa mal verificada — no un bug de
-U-Boot. Recopiar desde una fuente limpia y re-verificar el checksum resolvió
-todo sin tocar la lógica de partición.
+If `load`/`ext4load` reports the correct byte count but the kernel/initrd
+don't boot (or the content loaded into RAM is garbage), **don't assume it's a
+bug in this U-Boot's ext4 driver** — first, verify with `md.b <addr> 40` that
+the first loaded bytes have the correct magic header (`d0 0d fe ed` for a
+`.dtb`, an ELF/ARM64 header for the kernel). In this process, the real cause
+turned out to be that the source file on disk was already corrupted from an
+earlier, poorly-verified write — not a U-Boot bug. Re-copying from a clean
+source and re-verifying the checksum fixed everything without touching any
+partition logic.
 
-Si después de verificar los archivos siguen sin cargar bien vía ext4, como
-alternativa más robusta agregá una **partición FAT32 pequeña** (~256MB) para
-los archivos de boot (kernel/initrd/dtb/extlinux.conf) — el driver FAT de
-U-Boot es mucho más maduro que su driver ext4, y es el layout que usan la
-mayoría de boards RK3568 reales:
+If files still won't load correctly over ext4 after verifying them, as a more
+robust alternative add a **small FAT32 partition** (~256MB) for the boot files
+(kernel/initrd/dtb/extlinux.conf) — U-Boot's FAT driver is far more mature
+than its ext4 driver, and this is the layout most real RK3568 boards actually
+use:
 
 ```sh
-parted /dev/sdX mkpart primary fat32 <inicio> <fin>
+parted /dev/sdX mkpart primary fat32 <start> <end>
 mkfs.vfat -F 32 -n ARMBIBOOT /dev/sdXN
 ```
 
-Con el boot confirmado (`Machine model: Rockchip RK3568 NAS`, SATA/red/USB
-probando limpio, llega al wizard de primer boot de Armbian) — el software está
-validado. `reboot` desde Armbian por USB vuelve al firmware de fábrica en el
-eMMC sin tocarlo (nada se guardó con `saveenv`).
+With the boot confirmed (`Machine model: Rockchip RK3568 NAS`, SATA/network/
+USB all probing clean, reaching Armbian's first-boot wizard) — the software is
+validated. `reboot` from Armbian-over-USB goes back to the factory firmware on
+the eMMC untouched (nothing was saved with `saveenv`).
 
 ---
 
-## Parte 8 — Flashear al eMMC interno
+## Part 8 — Flashing to internal eMMC
 
-Con el software ya validado por USB, ahora sí al almacenamiento interno.
+With the software already validated over USB, now the internal storage.
 
-**Reparticionar `/dev/mmcblk0`** (hacerlo desde Armbian booteado por USB, no
-desde el firmware de fábrica — su rootfs puede desaparecer a mitad del proceso
-si borrás su propia partición):
+**Repartition `/dev/mmcblk0`** (do this from Armbian booted over USB, not
+from the factory firmware — its rootfs can disappear mid-process if you
+delete its own partition):
 
 ```sh
-parted /dev/mmcblk0 print free    # ver layout actual antes de asumir nada
-# Conservar particiones 1-5 (uboot/misc/boot/recovery/backup, primeros ~240MiB)
-# Borrar las de datos de fábrica (rootfs/oem/userdata) y crear:
-#   partición nueva FAT32 ~256MB (boot)
-#   partición nueva ext4 con el resto (~100% del espacio, no un valor exacto
-#     en MiB — GPT necesita margen para la tabla de respaldo al final del disco)
+parted /dev/mmcblk0 print free    # check the current layout before assuming anything
+# Keep partitions 1-5 (uboot/misc/boot/recovery/backup, first ~240MiB)
+# Delete the factory data ones (rootfs/oem/userdata) and create:
+#   a new FAT32 partition ~256MB (boot)
+#   a new ext4 partition for the rest (~100% of the space, not an exact MiB
+#     value — GPT needs headroom for the backup table at the very end of the disk)
 ```
 
-**Reboot obligatorio** después de terminar todos los cambios de `parted` y
-antes de hacer `mkfs`/`dd` en las particiones nuevas — la vista del kernel de
-la tabla de particiones queda desactualizada tras varios cambios seguidos sin
-reboot, y da error "attempt to access beyond end of device" aunque el GPT en
-disco ya esté correcto.
+**Reboot is mandatory** after finishing all `parted` changes and before doing
+any `mkfs`/`dd` on the new partitions — the kernel's live view of the
+partition table goes stale after several changes without an intervening
+reboot, giving "attempt to access beyond end of device" errors even though the
+on-disk GPT is already correct.
 
-**Formatear y copiar** (desde Armbian-por-USB, shell root vía el truco
-`init=/bin/sh`):
+**Format and copy** (from Armbian-over-USB, root shell via the `init=/bin/sh`
+trick):
 
 ```sh
-mkfs.vfat -F 32 /dev/mmcblk0pN      # partición boot nueva
-mkfs.ext4 /dev/mmcblk0pM            # partición root nueva
+mkfs.vfat -F 32 /dev/mmcblk0pN      # new boot partition
+mkfs.ext4 /dev/mmcblk0pM            # new root partition
 
-# copiar el rootfs completo del sistema corriendo (USB) al nuevo root:
-# rsync -aHAX puede segfaultear en este initramfs mínimo — usar tar en su lugar
+# copy the entire running (USB) system's rootfs to the new root:
+# rsync -aHAX can segfault in this minimal initramfs shell — use tar instead
 tar --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/mnt \
     -cf - -C / . | tar -xf - -C /mnt/newroot/
 ```
 
-Actualizá los UUID que quedaron grabados en el árbol copiado
-(`/etc/fstab`, `/boot/armbianEnv.txt`, `/boot/extlinux/extlinux.conf`) del
-UUID del pendrive al UUID real de la nueva partición root del eMMC (`sed`).
+Update the UUIDs baked into the copied tree (`/etc/fstab`,
+`/boot/armbianEnv.txt`, `/boot/extlinux/extlinux.conf`) from the USB drive's
+UUID to the new eMMC root partition's real UUID (`sed`).
 
-**Los archivos de boot van en la raíz plana de la partición FAT** (no bajo
-`/boot/`) si `extlinux.conf` los referencia sin `/boot/` — confirmá el layout
-real con `fatls` antes de asumir que replica la estructura del pendrive.
+**Boot files go in the flat root of the FAT partition** (not under `/boot/`)
+if `extlinux.conf` references them without `/boot/` — confirm the actual
+layout with `fatls` before assuming it mirrors the USB drive's structure.
 
-**Usar `fatload`, no `load` genérico, para mmc interno:**
+**Use `fatload`, not the generic `load`, for internal mmc:**
 ```
 fatload mmc 0:N <addr> Image
 fatload mmc 0:N <addr> uInitrd
 fatload mmc 0:N <addr> rk3568-nas.dtb
 ```
-(en este NAS, `load mmc 0:N ... /boot/Image` fallaba con "Unable to read file"
-pese a que `fatls` mostraba el archivo — `fatload` explícito funcionó de
-inmediato.)
+(on this NAS, `load mmc 0:N ... /boot/Image` failed with "Unable to read
+file" even though `fatls` showed the file existed — explicit `fatload` worked
+immediately.)
 
-**Bootargs para el eMMC:** `root=UUID=<uuid-real-del-root-nuevo>` — no
-`root=/dev/sda1` (eso era correcto solo para la prueba por USB).
+**Bootargs for eMMC:** `root=UUID=<real-new-root-uuid>` — not
+`root=/dev/sda1` (that was only correct for the USB test).
 
-Con eso cargado y verificado (`md.b`, siempre), `booti <kernel> <initrd> <fdt>`
-debería llegar a un login limpio.
+With that loaded and verified (`md.b`, always), `booti <kernel> <initrd> <fdt>`
+should reach a clean login.
 
-### Arranque automático sin intervención manual (la parte difícil)
+### Automatic boot with no manual intervention (the hard part)
 
-`saveenv` en este U-Boot vendor **no persiste nada** — no tiene backend de
-almacenamiento de entorno configurado (`CONFIG_ENV_IS_NOWHERE`, confirmable
-con `env info`). Cualquier `setenv` solo dura la sesión actual de U-Boot.
+`saveenv` on this vendor U-Boot **doesn't persist anything** — it has no
+configured environment storage backend (`CONFIG_ENV_IS_NOWHERE`, confirmable
+with `env info`). Any `setenv` only lasts the current U-Boot session.
 
-El `bootcmd` real de este board es:
+This board's real `bootcmd` is:
 ```
 boot_android ${devtype} ${devnum};boot_fit;bootrkp;run distro_bootcmd;
 ```
-(encadenado con `;`, corre cada uno sin condicional). `boot_fit` lee una
-**imagen FIT grabada en la partición 3 ("boot", 64MiB)** — el kernel de
-fábrica. Si esa partición no arranca algo válido (por ejemplo porque borraste
-su root partition), el control nunca pasa a `distro_bootcmd`.
+(semicolon-chained, runs each unconditionally). `boot_fit` reads a **FIT
+image baked into partition 3 ("boot", 64MiB)** — the factory kernel. If that
+partition doesn't boot something valid (for example because you deleted its
+root partition), control never passes to `distro_bootcmd`.
 
-**La solución real es reemplazar el contenido de esa partición FIT** con una
-construida para Armbian, usando `mkimage` (de `u-boot-tools`, viene con
-Armbian):
+**The real fix is replacing that FIT partition's content** with one built for
+Armbian, using `mkimage` (from `u-boot-tools`, ships with Armbian):
 
-1. Escribí un `.its` describiendo `kernel`+`fdt`+`ramdisk`
-   (`/incbin/("/boot/vmlinuz-...")`, con los nombres de archivo reales, no
-   symlinks; y el `initrd.img-*` crudo para el ramdisk, no el `uInitrd-*` ya
-   envuelto por U-Boot), más un nodo `configurations` con:
+1. Write a `.its` source describing `kernel`+`fdt`+`ramdisk`
+   (`/incbin/("/boot/vmlinuz-...")`, using the real filenames, not symlinks;
+   and the raw `initrd.img-*` for the ramdisk, not the U-Boot-wrapped
+   `uInitrd-*`), plus a `configurations` node with:
    ```
    bootargs = "root=UUID=<uuid> rootdelay=10 rw console=tty1 console=ttyS2,1500000n8 earlycon=uart8250,mmio32,0xfe660000 cma=256M";
    ```
-   **Embeber `bootargs` directo en el FIT es lo que lo hace funcionar sin
-   entorno persistente de U-Boot** — `boot_fit` usa lo que trae el FIT, no
-   necesita `setenv bootargs` previo.
+   **Embedding `bootargs` directly in the FIT is what makes this work without
+   a persistent U-Boot environment** — `boot_fit` uses whatever's in the FIT,
+   it doesn't need a prior `setenv bootargs`.
 2. `mkimage -f armbian.its armbian.itb`
-3. `dd if=armbian.itb of=/dev/mmcblk0p3 bs=1M conv=fsync` — **paso genuinamente
-   riesgoso** (sobreescribe el payload de boot de fábrica). Confirmá que la
-   imagen `.itb` entra en los 64MiB de la partición antes de escribir.
-4. El FIT de fábrica original estaba firmado (`sha256,rsa2048:dev`). El
-   reemplazo sin firmar hace que `boot_fit` falle **limpio** (no cuelga) —
-   justo lo necesario para que el `bootcmd` encadenado por `;` siga a
-   `bootrkp` y después a `distro_bootcmd`. No hace falta firmar nada.
+3. `dd if=armbian.itb of=/dev/mmcblk0p3 bs=1M conv=fsync` — **a genuinely
+   risky step** (overwrites the factory boot payload). Confirm the `.itb`
+   image fits within the partition's 64MiB before writing.
+4. The original factory FIT was signed (`sha256,rsa2048:dev`). The unsigned
+   replacement makes `boot_fit` fail **cleanly** (not hang) — exactly what's
+   needed for the `;`-chained `bootcmd` to fall through to `bootrkp` and then
+   `distro_bootcmd`. No need to sign anything.
 
-Aun con `boot_fit` fallando limpio, puede que `distro_bootcmd` todavía no
-arranque solo — dos causas típicas, ambas confirmadas en este proceso:
+Even with `boot_fit` failing through cleanly, `distro_bootcmd` might still not
+auto-boot — two typical causes, both confirmed in this process:
 
-- **`scan_dev_for_boot_part`** solo escanea particiones con el flag GPT
-  **bootable** puesto (si no hay ninguna marcada, cae a la partición 1 fija).
-  Fix:
+- **`scan_dev_for_boot_part`** only scans partitions with the GPT **bootable**
+  flag set (falls back to a hardcoded partition 1 if none are marked). Fix:
   ```sh
   parted /dev/mmcblk0 set N boot on
   ```
-  (cambio solo de metadata, no toca datos, bajo riesgo).
-- **Paths de `extlinux.conf` sin `/` inicial se resuelven relativos a la
-  carpeta de `extlinux.conf` misma** (`/extlinux/`), no a la raíz de la
-  partición, cuando el scanner automático de distro-boot los procesa (distinto
-  del `fatload` manual, que sí toma paths literales). Si tus archivos de boot
-  viven en la raíz de la partición FAT (no bajo `/boot/`), usá paths absolutos
-  con `/` inicial en `extlinux.conf`:
+  (metadata-only change, doesn't touch data, low risk).
+- **`extlinux.conf` paths without a leading `/` resolve relative to
+  `extlinux.conf`'s own directory** (`/extlinux/`), not the partition root,
+  when the automatic distro-boot scanner processes them (different from
+  manual `fatload`, which takes literal paths). If your boot files live at the
+  FAT partition's root (not under `/boot/`), use absolute paths with a
+  leading `/` in `extlinux.conf`:
   ```
   LINUX /Image
   INITRD /uInitrd
   FDT /rk3568-nas.dtb
   ```
 
-**Verificá el arranque automático de dos formas antes de darlo por bueno:**
-- `sync; echo b > /proc/sysrq-trigger` (reboot por software, instantáneo, salta
-  la secuencia de apagado de systemd).
-- Un power-cycle físico real (desenchufar/enchufar el cable de alimentación).
+**Verify automatic boot two ways before trusting it:**
+- `sync; echo b > /proc/sysrq-trigger` (software reboot, instant, skips
+  systemd's shutdown sequence).
+- A genuine physical power cycle (unplug/replug the power cable).
 
-Ambos deberían llegar al prompt de login **sin ninguna intervención manual de
-U-Boot**.
+Both should reach the login prompt **with zero manual U-Boot intervention**.
 
 ---
 
-## Parte 9 — Instalar OpenMediaVault
+## Part 9 — Installing OpenMediaVault
 
-Con Armbian arrancando solo desde el eMMC:
+With Armbian booting on its own from the eMMC:
 
 ```sh
 apt-get update && apt-get upgrade -y
@@ -432,75 +438,75 @@ reboot
 wget -O - https://github.com/OpenMediaVault-Plugin-Developers/installScript/raw/master/install | bash
 ```
 
-OMV 8 soporta Debian 13 (trixie) oficialmente — guía de referencia:
+OMV 8 officially supports Debian 13 (trixie) — reference guide:
 https://wiki.omv-extras.org/doku.php?id=omv8:armbian_trixie_install
 
-El script principal de instalación corre ~20-25 minutos y **termina
-reiniciando solo** — no esperes que vuelva un prompt de shell, esperá la
-secuencia de reboot en la consola serial.
+The main install script runs for ~20-25 minutes and **finishes by rebooting
+itself** — don't wait for a shell prompt to return, watch for the reboot
+sequence on the serial console instead.
 
-### Trampa: desincronización de kernel entre partición boot y root
+### Trap: kernel desync between the boot partition and root
 
-Si tu setup usa una **partición de boot separada** (FAT32, como en la Parte 8)
-en vez de que U-Boot lea directo de la partición root, un `apt upgrade`
-normal actualiza el kernel/initrd **dentro de la partición root**
-(`/boot/vmlinuz-*`, `/boot/uInitrd-*`), pero **no sabe nada de tu partición
-FAT separada** — que se queda con la versión vieja indefinidamente. El sistema
-sigue arrancando (con el kernel viejo pero válido), pero los módulos del
-kernel instalados por `apt` (en `/lib/modules/<version-nueva>/`) no
-corresponden al kernel que realmente está corriendo — cualquier cosa que
-dependa de un módulo (por ejemplo `md_mod` para RAID por software, o incluso
-`nls_iso8859-1` para el propio driver vfat) va a fallar con
-"Module X not found in directory /lib/modules/<version-vieja-que-ya-no-tiene-carpeta>".
+If your setup uses a **separate boot partition** (FAT32, as in Part 8)
+instead of U-Boot reading directly from the root partition, a normal
+`apt upgrade` updates the kernel/initrd **inside the root partition**
+(`/boot/vmlinuz-*`, `/boot/uInitrd-*`), but **knows nothing about your
+separate FAT partition** — which stays on the old version indefinitely. The
+system keeps booting fine (on the old but valid kernel), but the kernel
+modules installed by `apt` (in `/lib/modules/<new-version>/`) don't match the
+kernel actually running — anything that depends on a module (for example
+`md_mod` for software RAID, or even `nls_iso8859-1` for the vfat driver
+itself) will fail with
+"Module X not found in directory /lib/modules/<old-version-with-no-folder-anymore>".
 
-**Verificar el desajuste:**
+**Check for the mismatch:**
 ```sh
-uname -r                     # kernel realmente corriendo
-ls /lib/modules/             # kernels con módulos instalados
+uname -r                     # kernel actually running
+ls /lib/modules/             # kernels with installed modules
 ```
-Si no coinciden, hay que sincronizar manualmente después de cada
-`apt upgrade` que toque el kernel:
+If they don't match, you need to manually sync after every `apt upgrade` that
+touches the kernel:
 
 ```sh
-cp /boot/vmlinuz-<version-nueva> /ruta/a/particion-boot/Image
-cp /boot/uInitrd-<version-nueva> /ruta/a/particion-boot/uInitrd
-# el dtb normalmente no cambia entre actualizaciones de kernel, pero
-# verificar el checksum igual
-md5sum /boot/vmlinuz-<nueva> /ruta/a/particion-boot/Image   # confirmar copia limpia
+cp /boot/vmlinuz-<new-version> /path/to/boot-partition/Image
+cp /boot/uInitrd-<new-version> /path/to/boot-partition/uInitrd
+# the dtb usually doesn't change between kernel updates, but
+# verify the checksum anyway
+md5sum /boot/vmlinuz-<new> /path/to/boot-partition/Image   # confirm a clean copy
 ```
 
-Si la partición FAT no monta desde el Linux corriendo por el mismo motivo
-(kernel viejo sin el módulo `nls_iso8859-1` para el driver vfat), usá
-`mtools` (`mcopy`/`mdir`, sin necesidad de montar) como alternativa de
-espacio de usuario:
+If the FAT partition won't mount from the running Linux for the same reason
+(old kernel missing the `nls_iso8859-1` module for the vfat driver), use
+`mtools` (`mcopy`/`mdir`, no mounting required) as a userspace alternative:
 ```sh
 apt-get install -y mtools
 echo 'drive m: file="/dev/mmcblkXpN"' > /etc/mtools.conf
 mdir -i /dev/mmcblkXpN ::/
-mcopy -o -i /dev/mmcblkXpN /boot/vmlinuz-<nueva> ::/Image
+mcopy -o -i /dev/mmcblkXpN /boot/vmlinuz-<new> ::/Image
 ```
 
-Después de sincronizar y rebootear al kernel correcto, la partición FAT vuelve
-a montar normalmente (el kernel nuevo sí trae todos sus módulos), simplificando
-sincronizaciones futuras.
+After syncing and rebooting into the correct kernel, the FAT partition mounts
+normally again (the new kernel does have all its modules), simplifying future
+syncs.
 
 ---
 
-## Parte 10 — RAID 1 (opcional, si tenés 2+ discos)
+## Part 10 — RAID 1 (optional, if you have 2+ drives)
 
-Con `md_mod` cargando bien (Parte 9 resuelta si hacía falta):
+With `md_mod` loading fine (Part 9 resolved if needed):
 
 ```sh
-apt-get install -y openmediavault-md    # plugin de RAID de OMV, no viene por defecto
+apt-get install -y openmediavault-md    # OMV's RAID plugin, not installed by default
 ```
 
-En el firmware, el servicio RPC correspondiente es `MdMgmt` (no `RaidMgmt`,
-pese a que la sección del GUI puede llamarse "RAID Management").
+In the backend, the corresponding RPC service is `MdMgmt` (not `RaidMgmt`,
+even though the GUI section may be called "RAID Management").
 
-Si los discos ya tienen un filesystem creado por vos vía CLI en vez del wizard
-de OMV, primero hay que sacarlos de la config de OMV (`Storage → File Systems`,
-unmount, y `omv-confdbadm delete --uuid <uuid> conf.system.filesystem.mountpoint`)
-antes de que `mdadm` pueda tomar los discos crudos.
+If the drives already have a filesystem you created via CLI instead of OMV's
+wizard, you first need to remove them from OMV's config
+(`Storage → File Systems`, unmount, and
+`omv-confdbadm delete --uuid <uuid> conf.system.filesystem.mountpoint`) before
+`mdadm` can take the raw drives.
 
 ```sh
 wipefs -a /dev/sdX /dev/sdY
@@ -510,72 +516,72 @@ update-initramfs -u
 mkfs.ext4 -L raid1data /dev/md0
 ```
 
-Se puede formatear y usar el array mientras el resync inicial corre en segundo
-plano (`cat /proc/mdstat`) — no hace falta esperar a que termine.
+You can format and use the array while the initial resync runs in the
+background (`cat /proc/mdstat`) — no need to wait for it to finish.
 
-Registrar el filesystem resultante en OMV: `Storage → File Systems → + →
-Mount existing file system`, elegir `/dev/md0`.
-
----
-
-## Parte 11 — Carpeta compartida SMB
-
-1. `Storage → Shared Folders → +` — elegir el filesystem, nombre de carpeta.
-2. `Services → SMB/CIFS → Settings` — activar el servicio.
-3. `Services → SMB/CIFS → Shares → +` — asociar la shared folder creada.
-4. `Users → Users → +` — crear un usuario con password (esto también crea su
-   cuenta Samba automáticamente) y darle permisos read/write sobre la shared
-   folder.
-
-Acceso desde otra máquina: `smb://<ip-del-nas>/<nombre-share>`.
+Register the resulting filesystem in OMV: `Storage → File Systems → + →
+Mount existing file system`, pick `/dev/md0`.
 
 ---
 
-## Parte 12 — Acceso remoto fuera de la red local
+## Part 11 — SMB shared folder
 
-**No expongas SMB ni el panel de OMV directo a internet** — es exactamente el
-tipo de superficie de ataque que se eliminó en la Parte 5. La opción segura es
-una VPN mesh:
+1. `Storage → Shared Folders → +` — pick the filesystem, folder name.
+2. `Services → SMB/CIFS → Settings` — enable the service.
+3. `Services → SMB/CIFS → Shares → +` — attach the shared folder you created.
+4. `Users → Users → +` — create a user with a password (this also creates its
+   Samba account automatically) and grant it read/write permissions on the
+   shared folder.
+
+Access from another machine: `smb://<nas-ip>/<share-name>`.
+
+---
+
+## Part 12 — Remote access outside your local network
+
+**Don't expose SMB or the OMV panel directly to the internet** — that's
+exactly the kind of attack surface removed in Part 5. The safe option is a
+mesh VPN:
 
 ```sh
 curl -fsSL https://tailscale.com/install.sh | sh
-tailscale up --hostname=<nombre-que-quieras>
-# imprime una URL de login — abrirla en un navegador ya logueado a tu cuenta
-# Tailscale para autorizar el dispositivo
+tailscale up --hostname=<whatever-name-you-want>
+# prints a login URL — open it in a browser already logged into your
+# Tailscale account to authorize the device
 ```
 
-Con eso, el NAS obtiene una IP fija de Tailscale (`100.x.x.x`) accesible desde
-cualquier dispositivo conectado a la misma tailnet, sin abrir puertos en el
-router. `tailscale status` confirma la conexión; el servicio queda habilitado
-para arrancar solo en cada boot (`systemctl is-enabled tailscaled`).
+With that, the NAS gets a fixed Tailscale IP (`100.x.x.x`) reachable from any
+device on the same tailnet, with no router port-forwarding needed.
+`tailscale status` confirms the connection; the service is left enabled to
+start on every boot (`systemctl is-enabled tailscaled`).
 
 ---
 
-## Resumen de herramientas incluidas
+## Included tools summary
 
-| Script | Uso |
+| Script | Use |
 |---|---|
-| [`scripts/uboot_break.py`](scripts/uboot_break.py) | Flood de Ctrl+C durante power-on para interrumpir el autoboot de U-Boot (Parte 2) |
-| [`scripts/reboot_and_break.py`](scripts/reboot_and_break.py) | Igual, pero dispara el reboot vía `sysrq` primero — para cuando el NAS ya está corriendo Linux |
-| [`scripts/tcp_recv.py`](scripts/tcp_recv.py) | Servidor TCP crudo (sin HTTP) para recibir archivos grandes desde el NAS cuando no hay `nc`/`sshd` disponibles de ningún lado |
+| [`scripts/uboot_break.py`](scripts/uboot_break.py) | Ctrl+C flood during power-on to interrupt U-Boot's autoboot (Part 2) |
+| [`scripts/reboot_and_break.py`](scripts/reboot_and_break.py) | Same, but triggers the reboot via `sysrq` first — for when the NAS is already running Linux |
+| [`scripts/tcp_recv.py`](scripts/tcp_recv.py) | Raw TCP server (no HTTP) to receive large files from the NAS when neither `nc` nor `sshd` is available on either end |
 
-Todos requieren `pyserial` (`pip install pyserial`) para los dos primeros, y
-Python 3 estándar para el tercero. Ajustar `PORT` en los scripts de U-Boot si
-tu adaptador serial no es `/dev/ttyAMA0`.
+All three require `pyserial` (`pip install pyserial`) for the first two, and
+plain Python 3 for the third. Adjust `PORT` in the U-Boot scripts if your
+serial adapter isn't `/dev/ttyAMA0`.
 
-## Advertencia
+## Warning
 
-Esta guía involucra escribir directo a particiones de firmware/boot de bajo
-nivel (`dd` a `/dev/mmcblk0pN`, reemplazo de imagen FIT). Un error en la
-Parte 8 puede dejar el NAS sin arrancar. Mitigación real usada en este proceso:
-**siempre validar todo por USB primero (Parte 7)**, y guardar un backup de la
-zona crítica de boot del eMMC antes de tocarlo:
+This guide involves writing directly to low-level firmware/boot partitions
+(`dd` to `/dev/mmcblk0pN`, replacing a FIT image). A mistake in Part 8 can
+leave the NAS unable to boot. The real mitigation used throughout this
+process: **always validate everything over USB first (Part 7)**, and back up
+the eMMC's critical boot area before touching it:
 
 ```sh
 dd if=/dev/mmcblk0 bs=4M count=150 | gzip -c > nas_boot_backup.img.gz
 ```
 
-(600MB cubre de sobra el área raw de idbloader/U-Boot más las particiones 1-5
-— es lo único que un flasheo de Armbian realmente sobreescribe o pone en
-riesgo; el rootfs de fábrica en sí no se consideró necesario respaldar por no
-tener datos únicos).
+(600MB comfortably covers the raw idbloader/U-Boot area plus partitions 1-5
+— the only region an Armbian flash actually overwrites or puts at risk; the
+factory rootfs itself wasn't considered worth backing up since it holds no
+unique data).

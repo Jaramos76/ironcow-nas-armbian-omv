@@ -9,7 +9,7 @@ FLOOD_SECONDS = 45
 ser = serial.Serial(PORT, BAUD, timeout=0)
 ser.reset_input_buffer()
 
-# trigger reboot via sysrq (works even if userspace is degraded)
+# trigger a reboot via sysrq (works even if userspace is degraded)
 ser.write(b'echo b > /proc/sysrq-trigger\r\n')
 time.sleep(0.3)
 
@@ -25,7 +25,7 @@ while time.time() - start < FLOOD_SECONDS:
         log.flush()
     time.sleep(0.02)
 
-print("\n\n--- Fin del flood, escuchando 5s mas ---", flush=True)
+print("\n\n--- Flood done, listening for 5 more seconds ---", flush=True)
 end2 = time.time() + 5
 while time.time() < end2:
     data = ser.read(4096)
@@ -38,4 +38,4 @@ while time.time() < end2:
 
 log.close()
 ser.close()
-print("\n--- Listo ---", flush=True)
+print("\n--- Done ---", flush=True)

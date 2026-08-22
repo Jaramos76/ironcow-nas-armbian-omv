@@ -9,7 +9,7 @@ FLOOD_SECONDS = 45
 ser = serial.Serial(PORT, BAUD, timeout=0)
 ser.reset_input_buffer()
 
-print(f"Mandando Ctrl+C en loop durante {FLOOD_SECONDS}s. ENCHUFA EL POWER DE LA NAS AHORA.", flush=True)
+print(f"Flooding Ctrl+C for {FLOOD_SECONDS}s. PLUG IN THE NAS'S POWER NOW.", flush=True)
 
 log = open('/home/koko/uboot_break.log', 'wb')
 start = time.time()
@@ -23,7 +23,7 @@ while time.time() - start < FLOOD_SECONDS:
         log.flush()
     time.sleep(0.02)
 
-print("\n\n--- Fin del flood de Ctrl+C, ahora solo escuchando 5s mas ---", flush=True)
+print("\n\n--- Ctrl+C flood done, listening for 5 more seconds ---", flush=True)
 end2 = time.time() + 5
 while time.time() < end2:
     data = ser.read(4096)
@@ -36,4 +36,4 @@ while time.time() < end2:
 
 log.close()
 ser.close()
-print("\n--- Listo. Log completo en /home/koko/uboot_break.log ---", flush=True)
+print("\n--- Done. Full log at /home/koko/uboot_break.log ---", flush=True)
