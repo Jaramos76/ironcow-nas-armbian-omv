@@ -10,6 +10,11 @@ Este proceso se hizo íntegramente por consola serial UART, sin necesidad de abr
 la carcasa más allá de acceder al header de debug, y sin arriesgar el eMMC hasta
 validar todo primero por USB.
 
+> **Nota:** todos los valores como IPs, UUIDs, nombres de usuario y
+> contraseñas en esta guía son placeholders genéricos (`<ip-del-nas>`,
+> `<uuid>`, `/dev/sdX`, etc.). Reemplazalos siempre por los datos reales de
+> tu propio equipo — nunca copies un valor de esta guía como si fuera literal.
+
 ## Por qué
 
 El firmware de fábrica de este NAS:
